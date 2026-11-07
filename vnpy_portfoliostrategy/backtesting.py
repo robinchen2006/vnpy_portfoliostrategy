@@ -1,4 +1,5 @@
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from functools import lru_cache, partial
 from copy import copy
@@ -28,6 +29,20 @@ from .template import StrategyTemplate
 
 
 DEFAULT_SLIPPAGE_RATE: float = 3 / 10_000
+
+
+@dataclass(frozen=True)
+class FillEconomics:
+    """Canonical prices, fees and cash movement for one fill."""
+
+    reference_price: float
+    execution_price: float
+    reference_turnover: float
+    execution_turnover: float
+    broker_commission: float
+    stamp_tax: float
+    slippage: float
+    cash_change: float
 
 
 INTERVAL_DELTA_MAP: dict[Interval, timedelta] = {
@@ -856,9 +871,15 @@ class BacktestingEngine:
             self.trade_count += 1
 
             if long_cross:
-                trade_price = min(order.price, long_best_price)
+                reference_price = min(order.price, long_best_price)
             else:
-                trade_price = max(order.price, short_best_price)
+                reference_price = max(order.price, short_best_price)
+            economics = self._fill_economics(
+                order.direction,
+                order.vt_symbol,
+                reference_price,
+                order.volume,
+            )
 
             trade: TradeData = TradeData(
                 symbol=order.symbol,
@@ -867,18 +888,20 @@ class BacktestingEngine:
                 tradeid=str(self.trade_count),
                 direction=order.direction,
                 offset=order.offset,
-                price=trade_price,
+                price=economics.execution_price,
                 volume=order.volume,
                 datetime=self.datetime,
                 gateway_name=self.gateway_name,
             )
+            trade.reference_price = economics.reference_price
+            trade.reference_turnover = economics.reference_turnover
+            trade.execution_turnover = economics.execution_turnover
+            trade.broker_commission = economics.broker_commission
+            trade.stamp_tax = economics.stamp_tax
+            trade.slippage = economics.slippage
+            trade.cash_change = economics.cash_change
 
-            self.cash += self._trade_cash_change(
-                trade.direction,
-                trade.vt_symbol,
-                trade.price,
-                trade.volume,
-            )
+            self.cash += economics.cash_change
             self.strategy.update_trade(trade)
             self.trades[trade.vt_tradeid] = trade
 
@@ -935,24 +958,50 @@ class BacktestingEngine:
         price: float,
         volume: float,
     ) -> float:
+        return self._fill_economics(direction, vt_symbol, price, volume).cash_change
+
+    def _fill_economics(
+        self,
+        direction: Direction,
+        vt_symbol: str,
+        reference_price: float,
+        volume: float,
+    ) -> FillEconomics:
         size = self.sizes[vt_symbol]
-        turnover = volume * size * price
-        broker_commission = turnover * self.rates[vt_symbol]
+        quantity = volume * size
+        absolute_slippage = self.slippages[vt_symbol]
+        percentage_rate = self.slippage_rates[vt_symbol]
+        if direction == Direction.LONG:
+            execution_price = reference_price * (1 + percentage_rate) + absolute_slippage
+        else:
+            execution_price = reference_price * (1 - percentage_rate) - absolute_slippage
+        reference_turnover = quantity * reference_price
+        execution_turnover = quantity * execution_price
+        broker_commission = execution_turnover * self.rates[vt_symbol]
         minimum_commission = self.minimum_commissions[vt_symbol]
         if minimum_commission > 0:
             broker_commission = max(broker_commission, minimum_commission)
         broker_commission = round(broker_commission, 2)
         stamp_tax = (
-            round(turnover * self.stamp_tax_rates[vt_symbol], 2)
+            round(execution_turnover * self.stamp_tax_rates[vt_symbol], 2)
             if direction == Direction.SHORT
             else 0.0
         )
-        slippage = volume * size * self.slippages[vt_symbol]
-        slippage += round(turnover * self.slippage_rates[vt_symbol], 2)
-        costs = broker_commission + stamp_tax + slippage
+        slippage = round(abs(execution_price - reference_price) * quantity, 2)
         if direction == Direction.LONG:
-            return -turnover - costs
-        return turnover - costs
+            cash_change = -execution_turnover - broker_commission
+        else:
+            cash_change = execution_turnover - broker_commission - stamp_tax
+        return FillEconomics(
+            reference_price=reference_price,
+            execution_price=execution_price,
+            reference_turnover=reference_turnover,
+            execution_turnover=execution_turnover,
+            broker_commission=broker_commission,
+            stamp_tax=stamp_tax,
+            slippage=slippage,
+            cash_change=cash_change,
+        )
 
     def load_bars(
         self,
@@ -1106,6 +1155,7 @@ class ContractDailyResult:
 
         # 计算交易盈亏
         self.trade_count = len(self.trades)
+        additional_slippage_cost = 0.0
 
         for trade in self.trades:
             if trade.direction == Direction.LONG:
@@ -1118,8 +1168,17 @@ class ContractDailyResult:
             turnover: float = trade.volume * size * trade.price
 
             self.trading_pnl += pos_change * (self.close_price - trade.price) * size
-            self.slippage += trade.volume * size * slippage
-            self.slippage += round(turnover * slippage_rate, 2)
+            reference_price = getattr(trade, "reference_price", None)
+            if reference_price is None:
+                trade_slippage = trade.volume * size * slippage
+                trade_slippage += round(turnover * slippage_rate, 2)
+                additional_slippage_cost += trade_slippage
+            else:
+                trade_slippage = round(
+                    abs(trade.price - reference_price) * trade.volume * size,
+                    2,
+                )
+            self.slippage += trade_slippage
             self.turnover += turnover
 
             broker_commission = turnover * rate
@@ -1134,7 +1193,7 @@ class ContractDailyResult:
 
         # 计算每日盈亏
         self.total_pnl = self.trading_pnl + self.holding_pnl
-        self.net_pnl = self.total_pnl - self.commission - self.slippage
+        self.net_pnl = self.total_pnl - self.commission - additional_slippage_cost
 
     def update_close_price(self, close_price: float) -> None:
         """更新每日收盘价"""

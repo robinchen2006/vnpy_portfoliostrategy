@@ -31,6 +31,50 @@ def make_trade() -> TradeData:
 
 
 class BacktestingFeeDefaultsTest(unittest.TestCase):
+    def test_fill_economics_uses_execution_turnover_for_cash_and_fees(self) -> None:
+        engine = BacktestingEngine()
+        engine.set_parameters(
+            vt_symbols=[VT_SYMBOL],
+            interval=Interval.DAILY,
+            warmup=datetime(2024, 1, 1),
+            start=datetime(2024, 1, 2),
+            rates={VT_SYMBOL: 0.0001},
+            slippages={VT_SYMBOL: 0.0},
+            sizes={VT_SYMBOL: 1.0},
+            priceticks={VT_SYMBOL: 0.01},
+            minimum_commissions={VT_SYMBOL: 5.0},
+            stamp_tax_rates={VT_SYMBOL: 0.0005},
+            slippage_rates={VT_SYMBOL: 0.001},
+        )
+
+        fill = engine._fill_economics(Direction.SHORT, VT_SYMBOL, 10.0, 100)
+
+        self.assertAlmostEqual(fill.execution_price, 9.99)
+        self.assertAlmostEqual(fill.execution_turnover, 999.0)
+        self.assertEqual(fill.broker_commission, 5.0)
+        self.assertEqual(fill.stamp_tax, 0.5)
+        self.assertEqual(fill.slippage, 1.0)
+        self.assertAlmostEqual(fill.cash_change, 993.5)
+
+    def test_execution_price_slippage_is_not_deducted_twice_from_net_pnl(self) -> None:
+        trade = make_trade()
+        trade.reference_price = 100.0
+        trade.price = 100.1
+        result = ContractDailyResult(date(2024, 1, 2), 100.0)
+        result.add_trade(trade)
+
+        result.calculate_pnl(
+            pre_close=100.0,
+            start_pos=0.0,
+            size=1.0,
+            rate=0.0,
+            slippage=0.0,
+            slippage_rate=0.001,
+        )
+
+        self.assertEqual(result.slippage, 100.0)
+        self.assertAlmostEqual(result.net_pnl, -100.0)
+
     def test_engine_uses_three_bps_default_slippage_rate(self) -> None:
         engine = BacktestingEngine()
         engine.set_parameters(
